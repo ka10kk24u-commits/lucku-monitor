@@ -1,6 +1,7 @@
 import os
 import time
 import requests
+import cloudscraper
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -27,13 +28,15 @@ API_HEADERS = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 }
 
+scraper = cloudscraper.create_scraper()
+
 def send_tg(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("[⚠️ 未設定 TG_BOT_TOKEN 或 TG_CHAT_ID]\n" + text)
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={
+        scraper.post(url, json={
             "chat_id": TG_CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
@@ -122,26 +125,41 @@ def calc_pool_metrics(pool_id: int, info: dict, meta: dict) -> dict:
     }
 
 def fetch_single_pool(p_meta: dict):
-    pid = int(p_meta["card_sort_id"])
-    r = requests.post(
-        "https://api.luckutcg.com/api/getCardsBySort",
-        headers=API_HEADERS,
-        json={"page": "1", "limit": "9999", "card_sort_id": str(pid)},
-        timeout=10
-    )
-    res_json = r.json()
-    if res_json.get("results"):
-        return calc_pool_metrics(pid, res_json["results"], p_meta)
+    try:
+        pid = int(p_meta["card_sort_id"])
+        r = scraper.post(
+            "https://api.luckutcg.com/api/getCardsBySort",
+            headers=API_HEADERS,
+            json={"page": "1", "limit": "9999", "card_sort_id": str(pid)},
+            timeout=10
+        )
+        res_json = r.json()
+        if res_json and isinstance(res_json.get("results"), dict):
+            return calc_pool_metrics(pid, res_json["results"], p_meta)
+    except Exception as e:
+        print(f"[獲取卡池 #{p_meta.get('card_sort_id', '未知')} 異常] {e}")
     return None
 
 def scan_all_pools() -> list:
-    r = requests.post(
-        "https://api.luckutcg.com/api/getCardSortByBrand",
-        headers=API_HEADERS,
-        json={"page": "1", "limit": "100", "brand": ""},
-        timeout=10
-    )
-    pools_meta = r.json().get("results", {}).get("data", [])
+    try:
+        r = scraper.post(
+            "https://api.luckutcg.com/api/getCardSortByBrand",
+            headers=API_HEADERS,
+            json={"page": "1", "limit": "100", "brand": ""},
+            timeout=10
+        )
+        res_json = r.json()
+        results_data = res_json.get("results")
+        if isinstance(results_data, dict):
+            pools_meta = results_data.get("data", [])
+        elif isinstance(results_data, list):
+            pools_meta = results_data
+        else:
+            pools_meta = []
+    except Exception as e:
+        print(f"[掃描全部卡池失敗] {e}")
+        return []
+
     results = []
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_single_pool, p) for p in pools_meta]
@@ -150,8 +168,8 @@ def scan_all_pools() -> list:
                 data = f.result()
                 if data:
                     results.append(data)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[卡池解析異常] {e}")
     results.sort(key=lambda x: x["roi"], reverse=True)
     return results
 
@@ -163,14 +181,22 @@ def main():
 
     # 若為手動點擊觸發 (workflow_dispatch)，發送一則啟動測試與 Top 3 排行榜
     if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
-        pools = scan_all_pools()
-        known_pool_ids = {p["id"] for p in pools}
-        active = [p for p in pools if p["rem"] > 0 and p["id"] not in MUTED_POOL_IDS]
-        top3 = "\n".join([
-            f"• <b>#{p['id']} {p['name']}</b> | ROI: <b>{p['roi']:.1f}%</b> (Δ{p['delta_roi']:+.1f}%) | 剩:{p['rem']}/{p['total']}"
-            for p in active[:3]
-        ])
-        send_tg(f"✅ <b>GitHub 雲端監控已手動啟動！</b>\n將在雲端連續監控 {RUN_DURATION_MINUTES} 分鐘。\n\n🏆 <b>目前有貨 Top 3：</b>\n{top3}")
+        try:
+            pools = scan_all_pools()
+            known_pool_ids = {p["id"] for p in pools}
+            active = [p for p in pools if p["rem"] > 0 and p["id"] not in MUTED_POOL_IDS]
+            if active:
+                top3 = "\n".join([
+                    f"• <b>#{p['id']} {p['name']}</b> | ROI: <b>{p['roi']:.1f}%</b> (Δ{p['delta_roi']:+.1f}%) | 剩:{p['rem']}/{p['total']}"
+                    for p in active[:3]
+                ])
+                top_msg = f"\n\n🏆 <b>目前有貨 Top 3：</b>\n{top3}"
+            else:
+                top_msg = "\n\n🏆 <b>目前尚無有貨卡池</b>"
+            send_tg(f"✅ <b>GitHub 雲端監控已手動啟動！</b>\n將在雲端連續監控 {RUN_DURATION_MINUTES} 分鐘。{top_msg}")
+        except Exception as e:
+            print(f"[啟動初期掃描異常] {e}")
+            send_tg(f"⚠️ <b>GitHub 雲端監控啟動初期掃描異常：</b>\n{e}\n將繼續進入主監控迴圈。")
 
     while time.time() < end_ts:
         try:
@@ -216,4 +242,7 @@ def main():
         time.sleep(SCAN_INTERVAL_SEC)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[全域異常] {e}")
