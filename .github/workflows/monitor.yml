@@ -1,0 +1,33 @@
+name: Lucku 24H Cloud Monitor
+
+on:
+  schedule:
+    # 每 6 小時自動接力啟動一次 (每次跑 5.6 小時，達成全天候 24 小時不間斷監控)
+    - cron: '50 3,9,15,21 * * *'
+  workflow_dispatch: # 允許你在網頁上手動點擊按鈕立即測試啟動
+
+concurrency:
+  group: lucku-monitor-group
+  cancel-in-progress: true # 若新排程啟動時舊排程還沒結束，自動優雅交接
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run Monitor Script
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python -u monitor.py
