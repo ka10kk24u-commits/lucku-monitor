@@ -1,7 +1,7 @@
 import os
 import time
 import requests
-import cloudscraper
+from curl_cffi import requests as cffi_requests
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -25,10 +25,12 @@ API_HEADERS = {
     "language": "zh-Hant",
     "origin": "https://www.luckutcg.com",
     "referer": "https://www.luckutcg.com/",
-    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-scraper = cloudscraper.create_scraper()
+# 使用 curl_cffi 偽裝真實 Chrome TLS 指紋
+session = cffi_requests.Session(impersonate="chrome120")
+last_scan_error = ""
 
 def send_tg(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -36,7 +38,7 @@ def send_tg(text: str):
         return
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     try:
-        scraper.post(url, json={
+        requests.post(url, json={
             "chat_id": TG_CHAT_ID,
             "text": text,
             "parse_mode": "HTML",
@@ -125,29 +127,43 @@ def calc_pool_metrics(pool_id: int, info: dict, meta: dict) -> dict:
     }
 
 def fetch_single_pool(p_meta: dict):
+    pid = p_meta.get("card_sort_id")
     try:
-        pid = int(p_meta["card_sort_id"])
-        r = scraper.post(
+        pid_int = int(pid)
+        r = session.post(
             "https://api.luckutcg.com/api/getCardsBySort",
             headers=API_HEADERS,
-            json={"page": "1", "limit": "9999", "card_sort_id": str(pid)},
-            timeout=10
+            json={"page": "1", "limit": "9999", "card_sort_id": str(pid_int)},
+            timeout=15
         )
+        if r.status_code != 200:
+            print(f"[獲取卡池 #{pid} 異常] HTTP {r.status_code}: {r.text[:150]}")
+            return None
         res_json = r.json()
         if res_json and isinstance(res_json.get("results"), dict):
-            return calc_pool_metrics(pid, res_json["results"], p_meta)
+            return calc_pool_metrics(pid_int, res_json["results"], p_meta)
     except Exception as e:
-        print(f"[獲取卡池 #{p_meta.get('card_sort_id', '未知')} 異常] {e}")
+        print(f"[獲取卡池 #{pid} 異常] {type(e).__name__} - {e}")
     return None
 
 def scan_all_pools() -> list:
+    global last_scan_error
+    last_scan_error = ""
+    status_code = None
     try:
-        r = scraper.post(
+        r = session.post(
             "https://api.luckutcg.com/api/getCardSortByBrand",
             headers=API_HEADERS,
             json={"page": "1", "limit": "100", "brand": ""},
-            timeout=10
+            timeout=15
         )
+        status_code = r.status_code
+        if r.status_code != 200:
+            err = f"HTTP 狀態碼異常 [{r.status_code}]: {r.text[:200]}"
+            print(f"[掃描全部卡池失敗] {err}")
+            last_scan_error = err
+            return []
+
         res_json = r.json()
         results_data = res_json.get("results")
         if isinstance(results_data, dict):
@@ -156,8 +172,18 @@ def scan_all_pools() -> list:
             pools_meta = results_data
         else:
             pools_meta = []
+
+        if not pools_meta:
+            err = f"API 未回傳任何卡池資料 (msg: {res_json.get('msg', '無')})"
+            print(f"[掃描全部卡池警告] {err}")
+            last_scan_error = err
+            return []
+
     except Exception as e:
-        print(f"[掃描全部卡池失敗] {e}")
+        status_info = f" [HTTP {status_code}]" if status_code is not None else ""
+        err = f"請求/解析異常{status_info}: {type(e).__name__} - {e}"
+        print(f"[掃描全部卡池失敗] {err}")
+        last_scan_error = err
         return []
 
     results = []
@@ -169,7 +195,7 @@ def scan_all_pools() -> list:
                 if data:
                     results.append(data)
             except Exception as e:
-                print(f"[卡池解析異常] {e}")
+                print(f"[卡池解析異常] {type(e).__name__} - {e}")
     results.sort(key=lambda x: x["roi"], reverse=True)
     return results
 
@@ -185,18 +211,34 @@ def main():
             pools = scan_all_pools()
             known_pool_ids = {p["id"] for p in pools}
             active = [p for p in pools if p["rem"] > 0 and p["id"] not in MUTED_POOL_IDS]
-            if active:
+            if len(pools) == 0:
+                err_detail = last_scan_error if last_scan_error else "未知原因 (回傳 0 池)"
+                msg = (
+                    f"⚠️ <b>GitHub 雲端監控手動啟動 - 抓取卡池為 0！</b>\n"
+                    f"將在雲端連續監控 {RUN_DURATION_MINUTES} 分鐘。\n\n"
+                    f"❌ <b>錯誤原因：</b>\n<code>{err_detail}</code>"
+                )
+            elif active:
                 top3 = "\n".join([
                     f"• <b>#{p['id']} {p['name']}</b> | ROI: <b>{p['roi']:.1f}%</b> (Δ{p['delta_roi']:+.1f}%) | 剩:{p['rem']}/{p['total']}"
                     for p in active[:3]
                 ])
-                top_msg = f"\n\n🏆 <b>目前有貨 Top 3：</b>\n{top3}"
+                msg = (
+                    f"✅ <b>GitHub 雲端監控已手動啟動！</b>\n"
+                    f"將在雲端連續監控 {RUN_DURATION_MINUTES} 分鐘。\n\n"
+                    f"🏆 <b>目前有貨 Top 3：</b>\n{top3}"
+                )
             else:
-                top_msg = "\n\n🏆 <b>目前尚無有貨卡池</b>"
-            send_tg(f"✅ <b>GitHub 雲端監控已手動啟動！</b>\n將在雲端連續監控 {RUN_DURATION_MINUTES} 分鐘。{top_msg}")
+                msg = (
+                    f"✅ <b>GitHub 雲端監控已手動啟動！</b>\n"
+                    f"將在雲端連續監控 {RUN_DURATION_MINUTES} 分鐘。\n\n"
+                    f"🏆 <b>目前共抓取 {len(pools)} 池，但尚無有貨卡池</b>"
+                )
+            send_tg(msg)
         except Exception as e:
-            print(f"[啟動初期掃描異常] {e}")
-            send_tg(f"⚠️ <b>GitHub 雲端監控啟動初期掃描異常：</b>\n{e}\n將繼續進入主監控迴圈。")
+            err_msg = f"[啟動初期掃描異常] {type(e).__name__} - {e}"
+            print(err_msg)
+            send_tg(f"⚠️ <b>GitHub 雲端監控啟動初期掃描異常：</b>\n<code>{err_msg}</code>\n將繼續進入主監控迴圈。")
 
     while time.time() < end_ts:
         try:

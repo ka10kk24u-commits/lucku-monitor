@@ -24,7 +24,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests cloudscraper
+        run: pip install curl_cffi requests
 
       - name: Run Monitor Script
         env:
