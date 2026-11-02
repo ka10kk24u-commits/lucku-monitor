@@ -14,6 +14,8 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,6 +27,11 @@ jobs:
 
       - name: Install dependencies
         run: pip install curl_cffi requests
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
       - name: Run Monitor Script
         env:

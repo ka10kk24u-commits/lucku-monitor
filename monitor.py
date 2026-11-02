@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import subprocess
 import requests
 from curl_cffi import requests as cffi_requests
 from datetime import datetime, timezone, timedelta
@@ -12,10 +14,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 # 雲端運行參數設定
 SCAN_INTERVAL_SEC = 60          # 每 60 秒掃描一次全站
 RUN_DURATION_MINUTES = 340      # 單次雲端任務持續運行 340 分鐘 (約 5.6 小時，無縫接力每 6 小時的排程)
-ALARM_ROI_THRESHOLD = 95.0      # 回本率 >= 95% 觸發警報 (抓每日必賺池與 97% 池)
-ALARM_DELTA_ROI = 6.0           # 或撿漏指數 ΔROI >= +6.0% 且當前 ROI >= 80% 觸發警報
-PC_PACK_VALUE = 15.0            # PC散包預設估值
-MUTED_POOL_IDS = {40}           # 預設忽略 #40 新人限2次池 (可透過 /mute 或 /unmute 動態增刪)
+STATE_FILE = "state.json"       # 跨班次持久化記憶檔案
 
 HK_TZ = timezone(timedelta(hours=8))
 
@@ -28,10 +27,93 @@ API_HEADERS = {
     "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+# 預設狀態設定
+DEFAULT_STATE = {
+    "muted_pool_ids": [40],
+    "alarm_roi_threshold": 95.0,
+    "alarm_delta_roi": 6.0,
+    "pc_pack_value": 15.0,
+    "alerted_history": {},
+    "known_pool_ids": []
+}
+
+def load_state() -> dict:
+    """載入 state.json，若檔案不存在或格式毀損則使用預設值"""
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                state = DEFAULT_STATE.copy()
+                state.update(data)
+                state["muted_pool_ids"] = list(state.get("muted_pool_ids", [40]))
+                state["alarm_roi_threshold"] = float(state.get("alarm_roi_threshold", 95.0))
+                state["alarm_delta_roi"] = float(state.get("alarm_delta_roi", 6.0))
+                state["pc_pack_value"] = float(state.get("pc_pack_value", 15.0))
+                state["alerted_history"] = dict(state.get("alerted_history", {}))
+                state["known_pool_ids"] = list(state.get("known_pool_ids", []))
+                print(f"[載入記憶] 成功載入 {STATE_FILE}: 靜音 {state['muted_pool_ids']}, 門檻 ROI {state['alarm_roi_threshold']}%, 已記錄 {len(state['known_pool_ids'])} 池, 歷史警報 {len(state['alerted_history'])} 筆")
+                return state
+        except Exception as e:
+            print(f"[載入記憶失敗，使用預設值] {e}")
+    return DEFAULT_STATE.copy()
+
+# 初始化全局參數 (從持久化記憶讀取)
+_init_state = load_state()
+MUTED_POOL_IDS = set(int(x) for x in _init_state["muted_pool_ids"])
+ALARM_ROI_THRESHOLD = float(_init_state["alarm_roi_threshold"])
+ALARM_DELTA_ROI = float(_init_state["alarm_delta_roi"])
+PC_PACK_VALUE = float(_init_state["pc_pack_value"])
+alerted_history = {int(k): float(v) for k, v in _init_state.get("alerted_history", {}).items()}
+known_pool_ids = set(int(x) for x in _init_state.get("known_pool_ids", []))
+
 # 使用 curl_cffi 偽裝真實 Chrome TLS 指紋
 session = cffi_requests.Session(impersonate="chrome120")
 last_scan_error = ""
 latest_pools = []
+
+def save_state(sync_git: bool = True):
+    """將當前記憶寫入 state.json，並在 GitHub Actions 環境中同步 commit & push 回 GitHub"""
+    state_data = {
+        "muted_pool_ids": sorted(list(MUTED_POOL_IDS)),
+        "alarm_roi_threshold": round(float(ALARM_ROI_THRESHOLD), 2),
+        "alarm_delta_roi": round(float(ALARM_DELTA_ROI), 2),
+        "pc_pack_value": round(float(PC_PACK_VALUE), 2),
+        "alerted_history": {str(k): round(float(v), 2) for k, v in alerted_history.items()},
+        "known_pool_ids": sorted(list(known_pool_ids))
+    }
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[寫入本地 {STATE_FILE} 失敗] {e}")
+        return
+
+    # 若在 GitHub Actions 雲端容器中，自動同步回 GitHub
+    if sync_git and os.getenv("GITHUB_ACTIONS") == "true":
+        try:
+            subprocess.run(["git", "add", STATE_FILE], timeout=15, check=True, capture_output=True)
+            status_res = subprocess.run(["git", "diff", "--staged", "--quiet"], timeout=10)
+            if status_res.returncode == 0:
+                # 內容無變化，略過提交
+                return
+            commit_res = subprocess.run(
+                ["git", "commit", "-m", "chore: update bot state [skip ci]"],
+                timeout=15,
+                capture_output=True,
+                text=True
+            )
+            if commit_res.returncode != 0 and "nothing to commit" in commit_res.stdout:
+                return
+            subprocess.run(["git", "pull", "--rebase", "origin", "main"], timeout=30, capture_output=True, text=True)
+            push_res = subprocess.run(["git", "push", "origin", "main"], timeout=30, capture_output=True, text=True)
+            if push_res.returncode == 0:
+                print(f"[Git 記憶同步] {STATE_FILE} 已成功同步推送至 GitHub")
+            else:
+                print(f"[Git 記憶同步失敗] push 失敗: {push_res.stderr}")
+        except subprocess.TimeoutExpired:
+            print("[Git 記憶同步逾時] 略過本次同步")
+        except Exception as e:
+            print(f"[Git 記憶同步異常] {e}")
 
 def send_tg(text: str, reply_to_message_id: int = None):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -66,7 +148,7 @@ def setup_tg_commands():
         {"command": "snipe", "description": "查看撿漏指數 ΔROI Top 5"},
         {"command": "daily", "description": "查看每日任務與限抽福利池狀態"},
         {"command": "status", "description": "查看目前監控設定、靜音名單與運行狀態"},
-        {"command": "help", "description": "顯示完整指令說明 (含 /pool, /mute, /unmute, /roi)"}
+        {"command": "help", "description": "顯示完整指令說明 (含 /pool, /mute, /roi 等)"}
     ]
     try:
         r = requests.post(url, json={"commands": commands}, timeout=10)
@@ -318,7 +400,7 @@ def handle_daily() -> str:
     ]
     if not daily_pools:
         return "ℹ️ 目前全站未發現每日任務或福利限抽卡池。"
-    
+
     lines = ["🎁 <b>每日任務 / 福利限抽卡池狀態：</b>\n"]
     for p in daily_pools:
         stock_status = f"剩餘: <b>{p['rem']} / {p['total']}</b> 張" if p['rem'] > 0 else "<b>已售罄 (0 庫存)</b>"
@@ -387,7 +469,6 @@ def get_pool_detail(pid: int) -> str:
             tag_line = f"• <b>{tag}</b>: 剩 <b>{u}/{t}</b> (機率: <b>{prob:.2f}%</b>, 均價: <b>${avg_price:.0f}</b>)"
             lines.append(tag_line)
 
-            # 前排大獎若在庫，列出各卡片與剩餘數量及價格 (取前 4 張)
             tag_lower = tag.lower()
             is_filler = any(k in tag_lower for k in ["5等", "五等", "6等", "六等", "7等", "七等", "pc", "白卡", "末賞"])
             if not is_filler and in_stock:
@@ -409,8 +490,9 @@ def handle_mute(arg: str) -> str:
     try:
         pid = int(arg)
         MUTED_POOL_IDS.add(pid)
+        save_state(sync_git=True)
         muted_list = sorted(list(MUTED_POOL_IDS))
-        return f"🔇 已將卡池 <b>#{pid}</b> 加入靜音名單。\n目前靜音卡池：<code>{muted_list}</code>"
+        return f"🔇 已將卡池 <b>#{pid}</b> 加入靜音名單。\n目前靜音卡池：<code>{muted_list}</code>\n<i>(已同步至 GitHub 永久記憶)</i>"
     except Exception:
         return "⚠️ 請輸入正確的卡池 ID，例如：<code>/mute 40</code>"
 
@@ -419,8 +501,9 @@ def handle_unmute(arg: str) -> str:
     try:
         pid = int(arg)
         MUTED_POOL_IDS.discard(pid)
+        save_state(sync_git=True)
         muted_list = sorted(list(MUTED_POOL_IDS))
-        return f"🔊 已將卡池 <b>#{pid}</b> 移出靜音名單。\n目前靜音卡池：<code>{muted_list}</code>"
+        return f"🔊 已將卡池 <b>#{pid}</b> 移出靜音名單。\n目前靜音卡池：<code>{muted_list}</code>\n<i>(已同步至 GitHub 永久記憶)</i>"
     except Exception:
         return "⚠️ 請輸入正確的卡池 ID，例如：<code>/unmute 40</code>"
 
@@ -429,9 +512,30 @@ def handle_roi(arg: str) -> str:
     try:
         val = float(arg)
         ALARM_ROI_THRESHOLD = val
-        return f"⚙️ 已將警報回本率門檻修改為：<b>{ALARM_ROI_THRESHOLD:.1f}%</b>"
+        save_state(sync_git=True)
+        return f"⚙️ 已將警報回本率門檻修改為：<b>{ALARM_ROI_THRESHOLD:.1f}%</b>\n<i>(已同步至 GitHub 永久記憶)</i>"
     except Exception:
         return "⚠️ 請輸入有效的數字，例如：<code>/roi 95</code>"
+
+def handle_delta(arg: str) -> str:
+    global ALARM_DELTA_ROI
+    try:
+        val = float(arg)
+        ALARM_DELTA_ROI = val
+        save_state(sync_git=True)
+        return f"⚡ 已將警報撿漏指數 (ΔROI) 門檻修改為：<b>+{ALARM_DELTA_ROI:.1f}%</b>\n<i>(已同步至 GitHub 永久記憶)</i>"
+    except Exception:
+        return "⚠️ 請輸入有效的數字，例如：<code>/delta 6.0</code>"
+
+def handle_pc(arg: str) -> str:
+    global PC_PACK_VALUE
+    try:
+        val = float(arg)
+        PC_PACK_VALUE = val
+        save_state(sync_git=True)
+        return f"📦 已將 PC 散包預設估值修改為：<b>${PC_PACK_VALUE:.1f}</b>\n<i>(已同步至 GitHub 永久記憶)</i>"
+    except Exception:
+        return "⚠️ 請輸入有效的數字，例如：<code>/pc 15.0</code>"
 
 def handle_status(start_ts: float, end_ts: float) -> str:
     remaining_sec = max(0, int(end_ts - time.time()))
@@ -440,15 +544,18 @@ def handle_status(start_ts: float, end_ts: float) -> str:
     muted_str = ", ".join(f"#{x}" for x in sorted(MUTED_POOL_IDS)) if MUTED_POOL_IDS else "無"
     pools_cnt = len(latest_pools)
     active_cnt = len([p for p in latest_pools if p["rem"] > 0 and p["first_tag_rem"] > 0])
+    alerted_cnt = len(alerted_history)
 
     return (
-        f"📊 <b>雲端監控運行狀態：</b>\n\n"
+        f"📊 <b>雲端監控運行狀態與記憶設定：</b>\n\n"
         f"⏱️ <b>本輪剩餘時間：</b> {rem_min} 分 {rem_sec} 秒\n"
         f"🎯 <b>高回本率警報門檻：</b> ROI >= {ALARM_ROI_THRESHOLD:.1f}%\n"
         f"⚡ <b>撿漏指數警報門檻：</b> ΔROI >= +{ALARM_DELTA_ROI:.1f}% (且 ROI >= 80%)\n"
         f"📦 <b>PC 散包預設估值：</b> ${PC_PACK_VALUE:.1f}\n"
         f"🔇 <b>靜音卡池清單：</b> {muted_str}\n"
-        f"🗃️ <b>當前快取卡池：</b> 共 {pools_cnt} 池 (有貨且頭獎在: {active_cnt} 池)"
+        f"🗃️ <b>當前快取卡池：</b> 共 {pools_cnt} 池 (有貨且頭獎在: {active_cnt} 池)\n"
+        f"📝 <b>記憶已推播池：</b> {alerted_cnt} 池 (跨班次無縫記憶)\n"
+        f"💾 <b>記憶持久化狀態：</b> {STATE_FILE} 自動同步至 GitHub"
     )
 
 def handle_help() -> str:
@@ -458,10 +565,12 @@ def handle_help() -> str:
         "🎯 <code>/snipe</code> - 撿漏指數 ΔROI Top 5 (大獎沉底回本飆升)\n"
         "🎁 <code>/daily</code> - 每日任務 / 福利限抽卡池狀態\n"
         "🔍 <code>/pool &lt;ID&gt;</code> (或直接傳數字如 <code>54</code>) - 查詢卡池完整庫存、各賞別機率與剩餘大獎\n"
-        "🔇 <code>/mute &lt;ID&gt;</code> - 加入靜音名單 (不再觸發該池警報)\n"
-        "🔊 <code>/unmute &lt;ID&gt;</code> - 移出靜音名單\n"
-        "⚙️ <code>/roi &lt;數值&gt;</code> - 動態調整報警門檻 (如 <code>/roi 95</code>)\n"
-        "📊 <code>/status</code> - 檢視目前監控設定、靜音名單與運行狀態\n"
+        "🔇 <code>/mute &lt;ID&gt;</code> - 加入靜音名單 (不再觸發該池警報並永久記憶)\n"
+        "🔊 <code>/unmute &lt;ID&gt;</code> - 移出靜音名單 (並永久記憶)\n"
+        "⚙️ <code>/roi &lt;數值&gt;</code> - 動態調整回本率報警門檻 (如 <code>/roi 95</code>)\n"
+        "⚡ <code>/delta &lt;數值&gt;</code> - 動態調整撿漏指數門檻 (如 <code>/delta 6.0</code>)\n"
+        "📦 <code>/pc &lt;數值&gt;</code> - 動態調整 PC 散包估值 (如 <code>/pc 15.0</code>)\n"
+        "📊 <code>/status</code> - 檢視目前監控設定、靜音名單與剩餘時間\n"
         "❓ <code>/help</code> - 顯示此指令說明選單"
     )
 
@@ -497,6 +606,10 @@ def dispatch_tg_command(raw_text: str, start_ts: float, end_ts: float) -> str:
         return handle_unmute(arg)
     elif cmd == "/roi":
         return handle_roi(arg)
+    elif cmd == "/delta":
+        return handle_delta(arg)
+    elif cmd == "/pc":
+        return handle_pc(arg)
     elif cmd == "/status":
         return handle_status(start_ts, end_ts)
     elif cmd in ["/help", "/start"]:
@@ -506,23 +619,28 @@ def dispatch_tg_command(raw_text: str, start_ts: float, end_ts: float) -> str:
 # ======================== 主程式 ========================
 
 def main():
-    global latest_pools, ALARM_ROI_THRESHOLD, MUTED_POOL_IDS
+    global latest_pools, ALARM_ROI_THRESHOLD, ALARM_DELTA_ROI, PC_PACK_VALUE, MUTED_POOL_IDS, alerted_history, known_pool_ids
     start_ts = time.time()
     end_ts = start_ts + (RUN_DURATION_MINUTES * 60)
-    alerted_history = {}
-    known_pool_ids = set()
 
     # 1. 註冊 Telegram 選單指令
     setup_tg_commands()
 
-    # 2. 啟動時先抓一次最新 update_id，忽略啟動前的歷史訊息
+    # 2. 啟動時先抓一次最新 update_id，忽略啟動前的歷史舊訊息
     last_update_id = init_tg_offset()
 
     # 3. 初始掃描卡池
     try:
         pools = scan_all_pools()
         latest_pools = pools
-        known_pool_ids = {p["id"] for p in pools}
+        initial_new_pools = False
+        for p in pools:
+            if p["id"] not in known_pool_ids:
+                known_pool_ids.add(p["id"])
+                initial_new_pools = True
+        if initial_new_pools:
+            save_state(sync_git=True)
+
         active = [p for p in pools if p["rem"] > 0 and p["first_tag_rem"] > 0 and p["id"] not in MUTED_POOL_IDS]
 
         if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
@@ -572,16 +690,21 @@ def main():
                     latest_pools = pools
                 print(f"[{now_hk} HKT] 掃描完成，共 {len(pools)} 池")
 
+                state_changed = False
                 for p in pools:
                     pid = p["id"]
                     is_brand_new = (len(known_pool_ids) > 0 and pid not in known_pool_ids)
-                    known_pool_ids.add(pid)
+                    if pid not in known_pool_ids:
+                        known_pool_ids.add(pid)
+                        state_changed = True
 
                     if pid in MUTED_POOL_IDS:
                         continue
 
                     if p["rem"] == 0 or p["first_tag_rem"] == 0:
-                        alerted_history.pop(pid, None)
+                        if pid in alerted_history:
+                            alerted_history.pop(pid, None)
+                            state_changed = True
                         continue
 
                     cond_high_roi = p["roi"] >= ALARM_ROI_THRESHOLD
@@ -591,6 +714,7 @@ def main():
                         last_roi = alerted_history.get(pid)
                         if last_roi is None or (p["roi"] - last_roi >= 2.0):
                             alerted_history[pid] = p["roi"]
+                            state_changed = True
                             title = "🆕 <b>發現全新上架卡池！</b>" if is_brand_new and not cond_high_roi else f"🔥 <b>發現高價值卡池！({p['roi']:.1f}%)</b>"
                             lim_badge = f" [{p['limit_str']}]" if p["limit_str"] else ""
                             msg = (
@@ -603,6 +727,10 @@ def main():
                                 f"👉 <a href='https://www.luckutcg.com/#/cards/{pid}'>點擊直接打開該卡池</a>"
                             )
                             send_tg(msg)
+
+                # 若有推播紀錄變更或新卡池，自動同步回 GitHub
+                if state_changed:
+                    save_state(sync_git=True)
 
             # 在兩次定期掃描的空檔，進行 Telegram getUpdates 長輪詢 (timeout=5)
             time_until_scan = max(1, int(SCAN_INTERVAL_SEC - (time.time() - last_scan_ts)))
