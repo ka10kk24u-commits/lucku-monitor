@@ -5,17 +5,7 @@
   "alarm_roi_threshold": 95.0,
   "alarm_delta_roi": 6.0,
   "pc_pack_value": 15.0,
-  "alerted_history": {
-    "62": 76.9,
-    "63": 70.14,
-    "61": 89.17,
-    "59": 121.21,
-    "64": 119.75,
-    "66": 66.6,
-    "35": 97.36,
-    "54": 95.34,
-    "21": 84.95
-  },
+  "alerted_history": {},
   "known_pool_ids": [
     19,
     20,
