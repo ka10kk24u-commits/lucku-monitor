@@ -1,0 +1,37 @@
+name: Update Market Prices Cache
+
+on:
+  schedule:
+    # 每 12 小時低頻更新一次 SNKRDUNK 港幣真實市價快取 (HKT 10:15 / 22:15)
+    - cron: '15 2,14 * * *'
+  workflow_dispatch: # 允許手動立即更新市價快取
+
+concurrency:
+  group: lucku-price-updater
+  cancel-in-progress: true
+
+jobs:
+  update-prices:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install curl_cffi requests
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch SNKRDUNK Market Prices
+        run: python -u market_prices.py --max-age 10 --push

@@ -5,6 +5,7 @@
   "alarm_roi_threshold": 95.0,
   "alarm_delta_roi": 6.0,
   "pc_pack_value": 15.0,
+  "diamond_rate": 0.8,
   "alerted_history": {
     "59": 121.22,
     "64": 119.92,
